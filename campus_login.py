@@ -20,6 +20,7 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -69,9 +70,16 @@ CHECK_FALLBACK = [
     ("connect.rom.miui.com", "220.181.104.183"),
     ("connect.rom.miui.com", "202.69.4.32"),
 ]
-# 认证服务器解析失败时的备用 IP
-FALLBACK_PORTAL_IP = "192.168.7.221"
+# 认证服务器：优先解析域名，只有全都不通才退到内置 IP。
+# 学校换过认证服务器的 IP，写死一个值等于把可用性赌在某次配置上。
 PORTAL_DOMAIN = "login.csust.edu.cn"
+FALLBACK_PORTAL_IPS = ["192.168.7.221"]
+# 校园网内网 DNS。未认证时系统 DNS 常常被劫持或根本不可用，
+# 但校园网自己的 DNS 一般还活着，用它解析认证服务器最接近真实情况。
+CAMPUS_DNS_SERVERS = ["10.255.255.25"]
+# 运行时状态（上次真正连通的认证服务器 IP），和账号配置分开放
+STATE_PATH = os.path.join(BASE_DIR, "state.json")
+_IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 # 服务序号: 0=校园网默认; 如果账号绑定的是电信/联通/移动宽带, 登录报
 # "运营商标记错误"之类提示时, 在 config.json 里把 service_index 改成 1/2/3 试试
 DEFAULT_SERVICE_INDEX = 0
@@ -237,7 +245,21 @@ def load_config():
     if not username or not password:
         return None
     service = cfg.get("service_index", DEFAULT_SERVICE_INDEX)
-    return {"username": username, "password": password, "service_index": service}
+    # 守护检测间隔：可选项，不填就按默认 5 分钟走，完全不影响首次使用
+    try:
+        interval = int(cfg.get("check_interval", 300) or 300)
+    except (TypeError, ValueError):
+        interval = 300
+    interval = max(60, min(interval, 3600))
+    # 网络自救命令：可选。网卡驱动偶发挂死时，重启网卡比干等有用
+    reset_cmd = str(cfg.get("network_reset_cmd", "") or "").strip()
+    return {
+        "username": username,
+        "password": password,
+        "service_index": service,
+        "check_interval": interval,
+        "network_reset_cmd": reset_cmd,
+    }
 
 
 def save_config(username, password, service_index):
@@ -317,18 +339,185 @@ def check_network(timeout=5):
     return "offline", None, " / ".join(problems[-2:])
 
 
-def resolve_portal_ip(portal_host):
-    """把认证页域名解析成内网 IP; 解析不出来就用已知备用 IP。"""
+def load_state():
+    """读运行时状态（上次真正连通的认证服务器 IP 等）。读不到就当空的。"""
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _system_dns(host):
+    """系统 DNS 解析。未认证环境下经常拿不到，拿不到就返回空。"""
+    if not host:
+        return []
+    try:
+        ip = socket.gethostbyname(host)
+        if ip and not ip.startswith("127."):
+            return [ip]
+    except OSError:
+        pass
+    return []
+
+
+def _dns_query(host, server, timeout=1.5):
+    """向指定 DNS 服务器问一个 A 记录，返回 IP 列表。
+
+    自己拼 DNS 报文，而不是调 nslookup 子进程，原因有三个：
+      1. 快 —— 不用创建进程，失败时也不用等 Windows 自己的重试；
+      2. 稳 —— 不解析命令行输出，就不会被系统语言（Address / 地址）坑；
+      3. 小 —— 不需要额外依赖，也不用担心同学机器上 PATH 里没有 nslookup。
+    只支持 A 记录，校园网认证服务器就是 IPv4，够用。
+    """
+    if not host:
+        return []
+    try:
+        labels = host.rstrip(".").split(".")
+        qname = b""
+        for label in labels:
+            raw = label.encode("idna")
+            if not 0 < len(raw) < 64:
+                return []
+            qname += bytes([len(raw)]) + raw
+        qname += b"\x00"
+        # 事务 ID 随便取一个，收到包时校验一下，防止串包
+        tid = int.from_bytes(os.urandom(2), "big")
+        packet = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0) + qname
+        packet += struct.pack(">HH", 1, 1)  # QTYPE=A, QCLASS=IN
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(packet, (server, 53))
+            data, _ = s.recvfrom(2048)
+    except (OSError, UnicodeError):
+        return []
+
+    if len(data) < 12:
+        return []
+    rid, flags, qdcount, ancount = struct.unpack(">HHHH", data[:8])
+    if rid != tid or (flags & 0x000F):
+        return []
+
+    def skip_name(pos):
+        """跳过域名。0xC0 是压缩指针，指向别处，只占两字节。"""
+        while pos < len(data):
+            length = data[pos]
+            if length == 0:
+                return pos + 1
+            if length & 0xC0 == 0xC0:
+                return pos + 2
+            pos += 1 + length
+        return pos
+
+    pos = 12
+    for _ in range(qdcount):
+        pos = skip_name(pos) + 4  # 跳过 QTYPE + QCLASS
+
+    ips = []
+    for _ in range(ancount):
+        pos = skip_name(pos)
+        if pos + 10 > len(data):
+            break
+        rtype, rclass, _ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
+        pos += 10
+        if rtype == 1 and rclass == 1 and rdlen == 4 and pos + 4 <= len(data):
+            ip = "%d.%d.%d.%d" % tuple(data[pos:pos + 4])
+            if not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+        pos += rdlen
+    return ips
+
+
+def _portal_reachable(ip, timeout=1.2):
+    """探活：确认这个 IP 真的在提供认证服务。
+
+    只信 DNS 的答案是危险的 —— 解析结果可能已经过期，也可能被劫持到别的机器。
+    实际连一下 802/801 端口，能省掉后面一连串莫名其妙的失败。
+
+    超时给 1.2 秒就够：认证服务器在校园内网，正常 RTT 是毫秒级；
+    等两秒只会让「缓存的 IP 已经失效」这种少见情况白白拖慢启动。
+    """
+    for port in (802, 801):
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def resolve_portal_ips(portal_host, limit=4, skip_cache=False):
+    """按优先级列出候选认证服务器 IP（有序、去重）。
+
+    顺序：上次真正连通的 IP → 校园网 DNS → 系统 DNS → 内置备用 IP。
+    探活只用来排序，不用来淘汰 —— 端口不通也可能是临时抖动，
+    直接把人选删掉等于少一条后路，留给调用方逐个试更稳。
+    """
+    candidates = []
+    probed = {}
+
+    def add(ips, front=False):
+        for ip in ips:
+            if ip and ip not in candidates:
+                if front:
+                    candidates.insert(0, ip)
+                else:
+                    candidates.append(ip)
+
+    def reachable(ip):
+        if ip not in probed:
+            probed[ip] = _portal_reachable(ip)
+        return probed[ip]
+
+    # 上次连通过的 IP 还在，就直接返回它一个人选。
+    # 这是同学每天双击都会走的路，不该为了凑几个备用 IP 再等半秒 DNS。
+    # 真登录失败了，try_login 会再来一次完整解析。
+    cached = load_state().get("last_portal_ip")
+    if isinstance(cached, str) and not skip_cache and reachable(cached):
+        return [cached]
+
+    hosts = []
     for host in (portal_host, PORTAL_DOMAIN):
         if not host:
             continue
-        try:
-            ip = socket.gethostbyname(host)
-            if ip and not ip.startswith(("127.",)):
-                return ip
-        except OSError:
+        # 网关有时直接把人引到 IP 上，这种没必要再去查一次 DNS
+        if _IPV4_RE.fullmatch(host):
+            add([host])
             continue
-    return FALLBACK_PORTAL_IP
+        if host not in hosts:
+            hosts.append(host)
+
+    # 校园网 DNS 优先：它给的内网域名答案最接近真实
+    for host in hosts:
+        for server in CAMPUS_DNS_SERVERS:
+            add(_dns_query(host, server))
+    # 系统 DNS 兜底（已认证过、或系统 DNS 没被劫持时能拿到）
+    for host in hosts:
+        add(_system_dns(host))
+
+    if isinstance(cached, str):
+        add([cached])
+    add(FALLBACK_PORTAL_IPS)
+
+    head = [ip for ip in candidates if reachable(ip)]
+    tail = [ip for ip in candidates if ip not in head]
+    return (head + tail)[:limit]
+
+
+def resolve_portal_ip(portal_host):
+    """日常只用第一个候选；保留这个名字给日志和单点调用。"""
+    ips = resolve_portal_ips(portal_host)
+    return ips[0] if ips else FALLBACK_PORTAL_IPS[0]
 
 
 def login_new_api(cfg, params, portal_ip):
@@ -387,12 +576,37 @@ def login_old_api(cfg, params, portal_ip):
     return "成功" in r.text or "success" in r.text.lower(), r.text[:120]
 
 
-def try_login(cfg, params, portal_host):
-    portal_ip = resolve_portal_ip(portal_host)
-    log("认证服务器 IP: %s, 登录账号: %s" % (portal_ip, cfg["username"]))
+def explain_login_error(msg):
+    """把网关返回的原始报错翻译成能照着做的提示。
 
+    同学看到「运营商标记错误」「抢占登陆」这种词是不知道该干什么的，
+    这里直接告诉他改哪个字段。
+    """
+    text = str(msg or "").strip()
+    if not text:
+        return ""
+    low = text.lower()
+    if "密码" in text or "password" in low:
+        return "密码不对。删掉 config.json 再双击, 按提示重填一次"
+    if "欠费" in text or "余额" in text or "停机" in text or "有效期" in text:
+        return "账号欠费或已停机, 去学校自助服务充值后再试"
+    if "运营商" in text or "标记" in text or "绑定" in text:
+        return "服务序号不对: 校园网填 0, 电信 1, 联通 2, 移动 3"
+    if "在线" in text or "终端" in text or "超过" in text or "上限" in text:
+        return "账号已在别的设备在线, 程序会尝试顶号; 反复失败就先在手机上退出"
+    if "不存在" in text or "无效" in text or "格式" in text:
+        return "账号格式不对, 检查学号有没有填错"
+    return ""
+
+
+def _login_once(cfg, params, portal_ip):
+    """对单个认证服务器 IP 走一遍「新接口重试 + 老接口兜底」。
+
+    返回 (是否成功, 网关最后一句原话)。
+    """
     # 新版接口: 账号在别的设备在线时, 第一次请求返回"抢占登陆"(顶号下线),
     # 紧接着再请求一次就成功, 所以这里最多重试 3 次
+    msg = ""
     for attempt in range(1, 4):
         try:
             ok, msg = login_new_api(cfg, params, portal_ip)
@@ -404,7 +618,7 @@ def try_login(cfg, params, portal_host):
             status, _, _ = check_network()
             if status == "online":
                 log("确认已联网, 登录完成")
-                return True
+                return True, msg
             log("接口返回成功但外网仍不通, 继续尝试")
             continue
         if ("抢占" in msg) or ("再次登" in msg):
@@ -422,7 +636,57 @@ def try_login(cfg, params, portal_host):
         status, _, _ = check_network()
         if status == "online":
             log("确认已联网, 登录完成")
-            return True
+            return True, msg
+    return False, msg
+
+
+def try_login(cfg, params, portal_host):
+    def attempt_all(ips):
+        """逐个 IP 试。返回 (成功, 是否账号类错误, 最后一句原话)。"""
+        last = ""
+        for ip in ips:
+            ok, msg = _login_once(cfg, params, ip)
+            last = msg or last
+            if ok:
+                # 只记真正连通的那个。下次双击直接命中，不用再等解析
+                state = load_state()
+                if state.get("last_portal_ip") != ip:
+                    state["last_portal_ip"] = ip
+                    save_state(state)
+                return True, False, last
+            advice = explain_login_error(msg)
+            if advice:
+                # 密码错 / 欠费 / 服务序号错这类问题，换哪个 IP 都是同样结果，
+                # 直接停下来把话说明白，别让同学看它一个个试到超时
+                log("提示: " + advice)
+                return False, True, last
+            if len(ips) > 1:
+                log("%s 两个接口都没成功, 换下一个候选" % ip)
+        return False, False, last
+
+    portal_ips = resolve_portal_ips(portal_host)
+    log("候选认证服务器: %s, 登录账号: %s" % (", ".join(portal_ips), cfg["username"]))
+
+    ok, account_error, last_msg = attempt_all(portal_ips)
+    if ok or account_error:
+        return ok
+
+    # 刚才只试了缓存的那一个（快速路径），这里再完整解析一轮。
+    # 学校换过认证服务器 IP 时，靠的就是这一轮兜住。
+    if len(portal_ips) == 1:
+        rest = [
+            ip
+            for ip in resolve_portal_ips(portal_host, skip_cache=True)
+            if ip not in portal_ips
+        ]
+        if rest:
+            log("缓存 IP 未成功, 展开完整候选: %s" % ", ".join(rest))
+            ok, _, last_msg = attempt_all(rest)
+            if ok:
+                return True
+
+    if last_msg:
+        log("最后失败原因: %s" % last_msg)
     return False
 
 
@@ -465,10 +729,12 @@ def run():
 
 
 def keepalive(cfg):
-    """每 5 分钟探测一次: 掉线就重新登录; 连续 3 次完全断网(离开校园/关机)则退出。"""
+    """按配置的间隔探测: 掉线就重连; 连续 3 次完全断网(离开校园/关机)则退出。"""
+    interval = cfg.get("check_interval", 300)
+    log("守护已启动, 每 %d 秒检测一次" % interval)
     offline_count = 0
     while True:
-        time.sleep(300)
+        time.sleep(interval)
         status, params, portal_host = check_network()
         if status == "online":
             offline_count = 0
@@ -480,8 +746,18 @@ def keepalive(cfg):
             continue
         offline_count += 1
         log("网络不通(%d/3)" % offline_count)
+        # 完全断网时给一次自救机会(可选配置): 有些无线网卡驱动会卡死,
+        # 此时重启网卡比一直干等有效得多。
+        reset_cmd = cfg.get("network_reset_cmd", "")
+        if reset_cmd and offline_count == 2:
+            log("执行网络自救命令: %s" % reset_cmd)
+            try:
+                subprocess.run(reset_cmd, shell=True, timeout=20, capture_output=True)
+                time.sleep(5)
+            except Exception as e:
+                log("自救命令执行失败: %s" % e)
         if offline_count >= 3:
-            log("连续 15 分钟无网络, 判定已不在校园网, 守护退出")
+            log("连续 %d 次无网络, 判定已不在校园网, 守护退出" % offline_count)
             return
 
 

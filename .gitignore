@@ -12,6 +12,7 @@ dist/
 # 本地账号与运行日志，绝对不要提交
 config.json
 login.log
+state.json
 
 # 编辑器
 .vscode/
