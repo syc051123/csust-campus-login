@@ -21,7 +21,7 @@
 
 ## 下载使用
 
-到 [Releases](../../releases/latest) 下载 `长沙理工-校园网一键连接.zip`，解压后双击 `校园网一键连接.exe`。
+到 [Releases](../../releases/latest) 下载 zip 包（`csust-campus-login-v1.0.0.zip`），解压后双击 `校园网一键连接.exe`。
 
 首次运行会引导填写学号、密码和服务序号（默认 `0` = 校园网，宽带账号填 `1`/`2`/`3`）。
 账号只保存在本机 `config.json`，不会上传到任何服务器。
